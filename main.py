@@ -1,329 +1,234 @@
+import kagglehub
 import os
+import glob
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
 import matplotlib.pyplot as plt
-import kagglehub
 
-from optimizer import run_optimizer
+# ---------------------------------------------------
+# Download dataset
+# ---------------------------------------------------
 
-LR = 0.01
-N_ITERS = 500
-TRAIN_STOCKS = 30
+path = kagglehub.dataset_download("borismarjanovic/price-volume-data-for-all-us-stocks-etfs")
 
+stock_files = glob.glob(os.path.join(path, "Stocks/*.txt"))
 
-# ─────────────────────────────────────────────
-# Indicators
-# ─────────────────────────────────────────────
-def add_indicators(df):
+# ---------------------------------------------------
+# Load one stock for training
+# ---------------------------------------------------
 
-    df = df.copy()
+def load_stock(file):
 
-    df['Return'] = df['Close'].pct_change()
+    df = pd.read_csv(file)
 
-    df['MA_5'] = df['Close'].rolling(5).mean()
-    df['MA_10'] = df['Close'].rolling(10).mean()
+    prices = df["Close"].values
 
-    df['EMA_10'] = df['Close'].ewm(span=10).mean()
+    returns = np.diff(prices) / prices[:-1]
 
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-
-    rs = gain / (loss + 1e-8)
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    ema12 = df['Close'].ewm(span=12).mean()
-    ema26 = df['Close'].ewm(span=26).mean()
-
-    df['MACD'] = ema12 - ema26
-
-    return df
+    return prices, returns
 
 
-# ─────────────────────────────────────────────
-# Load stock
-# ─────────────────────────────────────────────
-def load_random_stock(path, file):
+prices, returns = load_stock(stock_files[0])
 
-    df = pd.read_csv(os.path.join(path, "Stocks", file))
+# ---------------------------------------------------
+# RL Environment
+# ---------------------------------------------------
 
-    if len(df) < 50:
-        raise ValueError("Stock too short")
+class StockEnv:
 
-    df = add_indicators(df).dropna()
+    def __init__(self, prices, window=10):
 
-    if len(df) < 50:
-        raise ValueError("Indicators removed too much data")
+        self.prices = prices
+        self.window = window
 
-    features = [
-        'Open','High','Low','Close','Volume',
-        'Return','MA_5','MA_10','EMA_10','RSI','MACD'
-    ]
+        self.reset()
 
-    X = df[features].values
-    close = df['Close'].values
+    def reset(self):
 
-    # alpha target
-    fwd_return = np.roll(close, -5) / close - 1
+        self.t = self.window
+        self.position = 0
 
-    momentum = df['MA_5'] - df['MA_10']
-    mean_reversion = close - df['EMA_10']
+        return self._state()
 
-    alpha = (
-        fwd_return
-        + 0.1 * momentum.values
-        - 0.1 * mean_reversion.values
-    )
+    def _state(self):
 
-    alpha = alpha[:-5]
-    X = X[:-5]
-    close = close[:-5]
+        window_prices = self.prices[self.t-self.window:self.t]
 
-    if len(X) < 50:
-        raise ValueError("Not enough usable samples")
+        returns = np.diff(window_prices) / window_prices[:-1]
 
-    # normalize features
-    X_std = X.std(axis=0)
-    X_std[X_std == 0] = 1
-    X = (X - X.mean(axis=0)) / X_std
+        state = np.concatenate([returns, [self.position]])
 
-    # normalize alpha
-    alpha_std = alpha.std()
-    if alpha_std == 0:
-        alpha_std = 1
-    alpha = (alpha - alpha.mean()) / alpha_std
+        return state.astype(np.float32)
 
-    return X, alpha, close
+    def step(self, action):
 
+        # actions
+        # 0 short
+        # 1 flat
+        # 2 long
 
-# ─────────────────────────────────────────────
-# Objective
-# ─────────────────────────────────────────────
-def get_alpha_problem(X, alpha):
-
-    N = len(X)
-    REG = 0.01
-
-    def f(w):
-
-        pred = X @ w
-        position = np.tanh(pred)
-
-        pnl = np.mean(position * alpha)
-        penalty = REG * np.mean(position**2)
-
-        return -(pnl - penalty)
-
-    def grad_f(w):
-
-        pred = X @ w
-        position = np.tanh(pred)
-
-        dpos = 1 - position**2
-
-        pnl_grad = (X.T @ (dpos * alpha)) / N
-        penalty_grad = REG * (X.T @ (dpos * position)) / N
-
-        return -(pnl_grad - penalty_grad)
-
-    return f, grad_f
-
-
-# ─────────────────────────────────────────────
-# Visualization
-# ─────────────────────────────────────────────
-def visualize_trading(close, pred_signal, alpha, stock_name):
-
-    if len(close) < 2:
-        return
-
-    position = np.tanh(pred_signal)
-
-    pred_dir = np.sign(position)
-
-    true_dir = np.sign(
-        np.diff(close, append=close[-1])
-    )
-
-    correct = pred_dir == true_dir
-
-    pnl = np.cumsum(position * alpha)
-
-    fig = plt.figure(figsize=(14,8))
-
-    # price panel
-    ax1 = plt.subplot(3,1,1)
-
-    ax1.plot(close, color="black")
-
-    for i in range(len(close)-1):
-
-        if position[i] > 0:
-            ax1.axvspan(i, i+1, color="green", alpha=0.05)
+        if action == 0:
+            self.position = -1
+        elif action == 1:
+            self.position = 0
         else:
-            ax1.axvspan(i, i+1, color="red", alpha=0.05)
+            self.position = 1
 
-    ax1.set_title(f"{stock_name} Price with Long/Short Zones")
+        price_change = self.prices[self.t+1] - self.prices[self.t]
 
-    # accuracy panel
-    ax2 = plt.subplot(3,1,2)
+        reward = self.position * price_change
 
-    for i in range(len(close)-1):
+        self.t += 1
 
-        color = "green" if correct[i] else "red"
+        done = self.t >= len(self.prices)-2
 
-        ax2.plot(
-            [i,i+1],
-            [close[i],close[i+1]],
-            color=color,
-            linewidth=2
+        return self._state(), reward, done
+
+
+env = StockEnv(prices)
+
+state_dim = env.reset().shape[0]
+action_dim = 3
+
+# ---------------------------------------------------
+# DQN Model
+# ---------------------------------------------------
+
+class DQN(nn.Module):
+
+    def __init__(self, state_dim, action_dim):
+
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(state_dim,128),
+            nn.ReLU(),
+            nn.Linear(128,128),
+            nn.ReLU(),
+            nn.Linear(128,action_dim)
         )
 
-    ax2.set_title("Prediction Accuracy")
+    def forward(self,x):
 
-    # pnl panel
-    ax3 = plt.subplot(3,1,3)
-
-    ax3.plot(pnl, label="Strategy PnL")
-
-    ax3.set_title("Cumulative Strategy PnL")
-    ax3.legend()
-
-    plt.tight_layout()
-    plt.show()
+        return self.net(x)
 
 
-# ─────────────────────────────────────────────
-# Build training dataset
-# ─────────────────────────────────────────────
-def build_training_dataset(path, files, n_stocks):
+model = DQN(state_dim,action_dim)
 
-    chosen = np.random.choice(files, n_stocks, replace=False)
+optimizer = optim.Adam(model.parameters(),lr=1e-3)
 
-    Xs = []
-    alphas = []
+gamma = 0.99
 
-    for f in chosen:
+# ---------------------------------------------------
+# Replay Buffer
+# ---------------------------------------------------
 
-        try:
+buffer = []
 
-            X, alpha, _ = load_random_stock(path, f)
+def store(exp):
 
-            Xs.append(X)
-            alphas.append(alpha)
+    buffer.append(exp)
 
-        except:
-            continue
-
-    if len(Xs) == 0:
-        raise RuntimeError("No valid training stocks found")
-
-    X_all = np.vstack(Xs)
-    alpha_all = np.concatenate(alphas)
-
-    return X_all, alpha_all
+    if len(buffer) > 100000:
+        buffer.pop(0)
 
 
-# ─────────────────────────────────────────────
-# Evaluate random stocks
-# ─────────────────────────────────────────────
-def evaluate_on_random_stocks(path, files, w, n=5):
+def sample(batch=64):
 
-    chosen = np.random.choice(files, n, replace=False)
+    idx = np.random.choice(len(buffer),batch)
 
-    corrs = []
-    pnls = []
-    used_names = []
-
-    for f in chosen:
-
-        try:
-
-            X, alpha, close = load_random_stock(path, f)
-
-            pred = X @ w
-            position = np.tanh(pred)
-
-            corr = np.corrcoef(position, alpha)[0,1]
-            pnl = np.mean(position * alpha)
-
-            corrs.append(corr)
-            pnls.append(pnl)
-            used_names.append(f)
-
-            visualize_trading(close, pred, alpha, f)
-
-            print(f"\nStock: {f}")
-            print(f"Correlation: {corr:.4f}")
-            print(f"Alpha Capture: {pnl:.6f}")
-
-        except:
-            continue
-
-    if len(corrs) == 0:
-        print("No valid evaluation stocks")
-        return
-
-    # summary chart
-    plt.figure(figsize=(10,4))
-
-    x = np.arange(len(corrs))
-
-    plt.bar(x-0.2, corrs, width=0.4, label="Correlation")
-    plt.bar(x+0.2, pnls, width=0.4, label="Alpha Capture")
-
-    plt.xticks(x, used_names, rotation=45)
-
-    plt.legend()
-    plt.title("Model Performance")
-
-    plt.tight_layout()
-    plt.show()
+    return [buffer[i] for i in idx]
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-def main():
+# ---------------------------------------------------
+# Training
+# ---------------------------------------------------
 
-    path = kagglehub.dataset_download(
-        "borismarjanovic/price-volume-data-for-all-us-stocks-etfs"
-    )
+episodes = 200
 
-    files = os.listdir(os.path.join(path,"Stocks"))
+epsilon = 1.0
 
-    X_train, alpha_train = build_training_dataset(
-        path,
-        files,
-        TRAIN_STOCKS
-    )
+for ep in range(episodes):
 
-    f, grad_f = get_alpha_problem(X_train, alpha_train)
+    s = env.reset()
 
-    w0 = np.zeros(X_train.shape[1])
+    total_reward = 0
 
-    results = run_optimizer(
-        f,
-        grad_f,
-        w0,
-        learning_rates=[LR],
-        n_iters=N_ITERS,
-        method="adam"
-    )
+    while True:
 
-    ws, fs = results[LR]
-    w_final = ws[-1]
+        if random.random() < epsilon:
+            a = random.randint(0,2)
+        else:
+            with torch.no_grad():
+                q = model(torch.tensor(s))
+                a = torch.argmax(q).item()
 
-    print("Training complete")
+        s2,r,done = env.step(a)
 
-    evaluate_on_random_stocks(
-        path,
-        files,
-        w_final,
-        n=5
-    )
+        store((s,a,r,s2,done))
+
+        s = s2
+
+        total_reward += r
+
+        if len(buffer) > 1000:
+
+            batch = sample()
+
+            states = torch.tensor([b[0] for b in batch])
+            actions = torch.tensor([b[1] for b in batch])
+            rewards = torch.tensor([b[2] for b in batch])
+            next_states = torch.tensor([b[3] for b in batch])
+            dones = torch.tensor([b[4] for b in batch])
+
+            q = model(states)
+
+            q = q.gather(1,actions.unsqueeze(1)).squeeze()
+
+            with torch.no_grad():
+                q_next = model(next_states).max(1)[0]
+
+            target = rewards + gamma*q_next*(1-dones)
+
+            loss = ((q-target)**2).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        if done:
+            break
+
+    epsilon *= 0.995
+
+    print("Episode",ep,"Reward",total_reward)
+
+# ---------------------------------------------------
+# Test policy
+# ---------------------------------------------------
+
+s = env.reset()
+
+positions = []
+
+while True:
+
+    with torch.no_grad():
+
+        a = torch.argmax(model(torch.tensor(s))).item()
+
+    positions.append(a-1)
+
+    s,r,done = env.step(a)
+
+    if done:
+        break
 
 
-if __name__ == "__main__":
-    main()
-
+plt.plot(prices[:len(positions)])
+plt.plot(np.cumsum(positions))
+plt.show()
