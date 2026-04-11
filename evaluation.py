@@ -19,7 +19,7 @@ NUM_STOCKS = 5
 STEP = 5  # skip to reduce clutter
 
 # =========================
-# FEATURES (must match training)
+# FEATURES 
 # =========================
 def compute_features(df):
     df = df.copy()
@@ -29,9 +29,8 @@ def compute_features(df):
 
     df = df.dropna()
 
+    # engineered features
     df["ret"] = df["Close"].pct_change()
-    df["logret"] = np.log(df["Close"]).diff()
-    df["mom"] = df["Close"].diff(5)
     df["vol"] = df["ret"].rolling(20).std()
 
     df = df.dropna()
@@ -47,13 +46,13 @@ def normalize(X):
 
 
 # =========================
-# MODEL
+# MODEL (FIXED INPUT SIZE)
 # =========================
 class AlphaModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(WINDOW * 4, 256),
+            nn.Linear(WINDOW * 7, 256),  
             nn.ReLU(),
             nn.Linear(256, 64),
             nn.ReLU(),
@@ -69,7 +68,7 @@ class AlphaModel(nn.Module):
 # RUN SLIDING PREDICTIONS
 # =========================
 def run_predictions(df, model):
-    feats = df[["ret", "logret", "mom", "vol"]].values
+    feats = df[["Open", "High", "Low", "Close", "Volume", "ret", "vol"]].values
     prices = df["Close"].values
 
     preds = []
@@ -107,7 +106,7 @@ def plot_stock(df, preds, actuals, times, title):
     close = df["Close"].values
 
     plt.figure(figsize=(14, 5))
-    plt.plot(close, color="black", linewidth=1, label="Close Price")
+    plt.plot(close, linewidth=1, label="Close Price")
 
     for p, a, t in zip(preds, actuals, times):
 
@@ -119,10 +118,13 @@ def plot_stock(df, preds, actuals, times, title):
         color = "green" if correct else "red"
         marker = "o" if correct else "x"
 
-        plt.scatter(t, close[t],
-                    color=color,
-                    s=25,
-                    marker=marker)
+        plt.scatter(
+            t,
+            close[t],
+            color=color,
+            s=25,
+            marker=marker
+        )
 
     plt.title(f"{title} | Green=Correct Direction, Red=Wrong")
     plt.xlabel("Time")
@@ -149,7 +151,12 @@ def main():
     print("Loading model...")
 
     model = AlphaModel().to(DEVICE)
-    model.load_state_dict(torch.load("alpha_model.pth", map_location=DEVICE))
+
+    # 🔍 Optional debug (can remove later)
+    state_dict = torch.load("alpha_model.pth", map_location=DEVICE)
+    print("Checkpoint first layer shape:", state_dict["net.0.weight"].shape)
+
+    model.load_state_dict(state_dict)
     model.eval()
 
     print("Evaluating stocks...\n")
