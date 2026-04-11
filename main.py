@@ -17,7 +17,6 @@ EPOCHS = 50
 SAMPLES = 500
 LR = 1e-3
 
-
 # =========================
 # FEATURES
 # =========================
@@ -31,48 +30,21 @@ def compute_features(df):
 
     df["ret"] = df["Close"].pct_change()
     df["logret"] = np.log(df["Close"]).diff()
-    df["mom"] = df["Close"].diff(5)
+    df["mom5"] = df["Close"].pct_change(5)
     df["vol"] = df["ret"].rolling(20).std()
+    df["ma_ratio"] = df["Close"] / df["Close"].rolling(20).mean()
+    df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
+    df["vol_change"] = df["Volume"].pct_change()
 
     df = df.dropna()
     return df
 
 
-def normalize(X):
-    X = np.nan_to_num(X)
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0)
-    sd[sd < 1e-6] = 1
-    return (X - mu) / sd
-
-
 # =========================
-# MODEL (returns prediction)
+# BUILD DATASET 
 # =========================
-class AlphaModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(WINDOW * 4, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        x = x.reshape(x.shape[0], -1)
-        return self.net(x)
-
-
-# =========================
-# BUILD GLOBAL CROSS-SECTIONAL DATASET
-# =========================
-def load_all_data(files):
-    X_all = []
-    y_all = []
-    stock_ids = []
+def build_dataset(files):
+    data_by_date = {}
 
     for f in files:
         try:
@@ -84,111 +56,180 @@ def load_all_data(files):
         if len(df) < WINDOW + 10:
             continue
 
-        feats = df[["ret", "logret", "mom", "vol"]].values
+        feats = df[[
+            "ret", "logret", "mom5", "vol",
+            "ma_ratio", "hl_range", "vol_change"
+        ]].values
+
         prices = df["Close"].values
+        dates = pd.to_datetime(df["Date"]).values
 
         for i in range(len(df) - WINDOW - 5):
-
             X = feats[i:i+WINDOW]
-            if not np.isfinite(X).all():
-                continue
-
-            X = normalize(X)
-
             y = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
+            date = dates[i+WINDOW]
 
-            if not np.isfinite(y):
+            if not np.isfinite(X).all() or not np.isfinite(y):
                 continue
 
-            X_all.append(X)
-            y_all.append(y)
-            stock_ids.append(f)
+            if date not in data_by_date:
+                data_by_date[date] = {"X": [], "y": []}
 
-    return np.array(X_all), np.array(y_all), np.array(stock_ids)
+            data_by_date[date]["X"].append(X)
+            data_by_date[date]["y"].append(y)
 
+    # 🔥 convert lists → numpy ONCE (big speedup)
+    for date in data_by_date:
+        data_by_date[date]["X"] = np.stack(data_by_date[date]["X"])
+        data_by_date[date]["y"] = np.array(data_by_date[date]["y"])
 
-# =========================
-# CROSS-SECTIONAL BACKTEST
-# =========================
-def backtest_cross_section(model, X, y, stock_ids):
-    model.eval()
-
-    X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
-
-    with torch.no_grad():
-        preds = model(X).cpu().numpy().flatten()
-
-    # build dataframe
-    df = pd.DataFrame({
-        "pred": preds,
-        "ret": y,
-        "stock": stock_ids
-    })
-
-    equity = 1.0
-    curve = []
-
-    # simulate daily cross-section trading
-    for i in range(0, len(df), 1000):
-
-        batch = df.iloc[i:i+1000]
-        if len(batch) < 50:
-            continue
-
-        # rank stocks
-        batch = batch.sort_values("pred")
-
-        longs = batch.tail(TOP_K)
-        shorts = batch.head(TOP_K)
-
-        long_ret = longs["ret"].mean()
-        short_ret = shorts["ret"].mean()
-
-        pnl = long_ret - short_ret
-
-        # transaction cost
-        pnl -= FEE * 2 * TOP_K
-
-        equity *= (1 + pnl)
-        curve.append(equity)
-
-    return np.array(curve)
+    return data_by_date
 
 
 # =========================
-# SHARPE RATIO
+# NORMALIZATION
 # =========================
-def sharpe(curve):
-    rets = np.diff(curve) / curve[:-1]
-    if rets.std() == 0:
-        return 0
-    return np.sqrt(252) * rets.mean() / rets.std()
+def compute_normalization(data_by_date):
+    all_X = []
+
+    for date in data_by_date:
+        all_X.append(data_by_date[date]["X"])
+
+    all_X = np.concatenate(all_X, axis=0)
+
+    mu = all_X.mean(axis=0)
+    std = all_X.std(axis=0)
+    std[std < 1e-6] = 1
+
+    return mu, std
+
+
+def apply_normalization(data_by_date, mu, std):
+    for date in data_by_date:
+        data_by_date[date]["X"] = (data_by_date[date]["X"] - mu) / std
+
+
+# =========================
+# MODEL
+# =========================
+class AlphaModel(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(WINDOW * n_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        x = x.reshape(x.shape[0], -1)
+        return self.net(x).squeeze(-1)
+
+
+# =========================
+# RANKING LOSS
+# =========================
+def ranking_loss(pred, target):
+    pred = pred - pred.mean()
+    target = target - target.mean()
+
+    cov = (pred * target).mean()
+    pred_std = pred.std() + 1e-6
+    target_std = target.std() + 1e-6
+
+    corr = cov / (pred_std * target_std)
+    return -corr
 
 
 # =========================
 # TRAIN
 # =========================
-def train(model, X, y, epochs=3):
+def train(model, train_dates, data_by_date):
     opt = optim.Adam(model.parameters(), lr=LR)
-    loss_fn = nn.MSELoss()
 
-    X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
-    y = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(DEVICE)
-
-    for e in range(epochs):
+    for epoch in range(EPOCHS):
         model.train()
-        pred = model(X)
-        loss = loss_fn(pred, y)
+        losses = []
 
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        random.shuffle(train_dates)
 
-        print(f"epoch {e} loss {loss.item():.6f}")
+        for date in train_dates:
+            batch = data_by_date[date]
+
+            if len(batch["X"]) < 50:
+                continue
+
+            X = torch.from_numpy(batch["X"]).float().to(DEVICE)
+            y = torch.from_numpy(batch["y"]).float().to(DEVICE)
+
+            pred = model(X)
+            loss = ranking_loss(pred, y)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            losses.append(loss.item())
+
+        print(f"epoch {epoch} loss {np.mean(losses):.6f}")
 
 
 # =========================
-# MAIN PIPELINE
+# BACKTEST
+# =========================
+def backtest(model, val_dates, data_by_date):
+    model.eval()
+
+    equity = 1.0
+    curve = []
+
+    with torch.no_grad():
+        for date in sorted(val_dates):
+            batch = data_by_date[date]
+
+            if len(batch["X"]) < 50:
+                continue
+
+            X = torch.from_numpy(batch["X"]).float().to(DEVICE)
+            y = batch["y"]
+
+            pred = model(X).cpu().numpy()
+
+            df = pd.DataFrame({
+                "pred": pred,
+                "ret": y
+            })
+
+            df = df.sort_values("pred")
+
+            longs = df.tail(TOP_K)
+            shorts = df.head(TOP_K)
+
+            pnl = longs["ret"].mean() - shorts["ret"].mean()
+
+            pnl -= FEE  # realistic cost
+
+            equity *= (1 + pnl)
+            curve.append(equity)
+
+    return np.array(curve)
+
+
+# =========================
+# SHARPE
+# =========================
+def sharpe(curve):
+    rets = np.diff(curve) / curve[:-1]
+    if len(rets) < 2 or rets.std() == 0:
+        return 0
+    return np.sqrt(252) * rets.mean() / rets.std()
+
+
+# =========================
+# MAIN
 # =========================
 def main():
 
@@ -197,37 +238,40 @@ def main():
     )
 
     files = glob(os.path.join(path, "Stocks", "*.txt"))
-    files = random.sample(files, SAMPLES)  # controlled research set
+    files = random.sample(files, SAMPLES)
 
     print("stocks:", len(files))
 
     print("building dataset...")
-    X, y, stock_ids = load_all_data(files)
+    data_by_date = build_dataset(files)
 
-    print("total samples:", len(X))
+    dates = sorted(data_by_date.keys())
+    print("total dates:", len(dates))
 
-    # train/val split (time-aware approximate)
-    split = int(0.8 * len(X))
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
-    ids_val = stock_ids[split:]
+    split = int(0.8 * len(dates))
+    train_dates = dates[:split]
+    val_dates = dates[split:]
 
-    model = AlphaModel().to(DEVICE)
+    print("computing normalization...")
+    train_data = {d: data_by_date[d] for d in train_dates}
+    mu, std = compute_normalization(train_data)
+    apply_normalization(data_by_date, mu, std)
+
+    n_features = data_by_date[dates[0]]["X"].shape[2]
+
+    model = AlphaModel(n_features).to(DEVICE)
 
     print("training...")
-    train(model, X_train, y_train, epochs=EPOCHS)
+    train(model, train_dates, data_by_date)
 
     print("backtesting...")
-    curve = backtest_cross_section(model, X_val, y_val, ids_val)
+    curve = backtest(model, val_dates, data_by_date)
 
     s = sharpe(curve)
     print("\nFINAL SHARPE:", s)
 
-    # =========================
-    # SAVE MODEL
-    # =========================
     torch.save(model.state_dict(), "alpha_model.pth")
-    print("Saved model → alpha_model.pth")
+    print("Saved → alpha_model.pth")
 
 
 if __name__ == "__main__":
