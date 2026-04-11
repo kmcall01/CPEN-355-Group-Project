@@ -1,234 +1,234 @@
-import kagglehub
 import os
-import glob
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from glob import glob
+import kagglehub
 import random
-import matplotlib.pyplot as plt
 
-# ---------------------------------------------------
-# Download dataset
-# ---------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-path = kagglehub.dataset_download("borismarjanovic/price-volume-data-for-all-us-stocks-etfs")
-
-stock_files = glob.glob(os.path.join(path, "Stocks/*.txt"))
-
-# ---------------------------------------------------
-# Load one stock for training
-# ---------------------------------------------------
-
-def load_stock(file):
-
-    df = pd.read_csv(file)
-
-    prices = df["Close"].values
-
-    returns = np.diff(prices) / prices[:-1]
-
-    return prices, returns
+WINDOW = 64
+TOP_K = 20
+FEE = 0.0005
+EPOCHS = 50
+SAMPLES = 500
+LR = 1e-3
 
 
-prices, returns = load_stock(stock_files[0])
+# =========================
+# FEATURES
+# =========================
+def compute_features(df):
+    df = df.copy()
 
-# ---------------------------------------------------
-# RL Environment
-# ---------------------------------------------------
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-class StockEnv:
+    df = df.dropna()
 
-    def __init__(self, prices, window=10):
+    df["ret"] = df["Close"].pct_change()
+    df["logret"] = np.log(df["Close"]).diff()
+    df["mom"] = df["Close"].diff(5)
+    df["vol"] = df["ret"].rolling(20).std()
 
-        self.prices = prices
-        self.window = window
-
-        self.reset()
-
-    def reset(self):
-
-        self.t = self.window
-        self.position = 0
-
-        return self._state()
-
-    def _state(self):
-
-        window_prices = self.prices[self.t-self.window:self.t]
-
-        returns = np.diff(window_prices) / window_prices[:-1]
-
-        state = np.concatenate([returns, [self.position]])
-
-        return state.astype(np.float32)
-
-    def step(self, action):
-
-        # actions
-        # 0 short
-        # 1 flat
-        # 2 long
-
-        if action == 0:
-            self.position = -1
-        elif action == 1:
-            self.position = 0
-        else:
-            self.position = 1
-
-        price_change = self.prices[self.t+1] - self.prices[self.t]
-
-        reward = self.position * price_change
-
-        self.t += 1
-
-        done = self.t >= len(self.prices)-2
-
-        return self._state(), reward, done
+    df = df.dropna()
+    return df
 
 
-env = StockEnv(prices)
+def normalize(X):
+    X = np.nan_to_num(X)
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    sd[sd < 1e-6] = 1
+    return (X - mu) / sd
 
-state_dim = env.reset().shape[0]
-action_dim = 3
 
-# ---------------------------------------------------
-# DQN Model
-# ---------------------------------------------------
-
-class DQN(nn.Module):
-
-    def __init__(self, state_dim, action_dim):
-
+# =========================
+# MODEL (returns prediction)
+# =========================
+class AlphaModel(nn.Module):
+    def __init__(self):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(state_dim,128),
+            nn.Linear(WINDOW * 4, 256),
             nn.ReLU(),
-            nn.Linear(128,128),
+            nn.Linear(256, 64),
             nn.ReLU(),
-            nn.Linear(128,action_dim)
+            nn.Linear(64, 1)
         )
 
-    def forward(self,x):
-
+    def forward(self, x):
+        x = x.reshape(x.shape[0], -1)
         return self.net(x)
 
 
-model = DQN(state_dim,action_dim)
+# =========================
+# BUILD GLOBAL CROSS-SECTIONAL DATASET
+# =========================
+def load_all_data(files):
+    X_all = []
+    y_all = []
+    stock_ids = []
 
-optimizer = optim.Adam(model.parameters(),lr=1e-3)
+    for f in files:
+        try:
+            df = pd.read_csv(f)
+            df = compute_features(df)
+        except:
+            continue
 
-gamma = 0.99
+        if len(df) < WINDOW + 10:
+            continue
 
-# ---------------------------------------------------
-# Replay Buffer
-# ---------------------------------------------------
+        feats = df[["ret", "logret", "mom", "vol"]].values
+        prices = df["Close"].values
 
-buffer = []
+        for i in range(len(df) - WINDOW - 5):
 
-def store(exp):
+            X = feats[i:i+WINDOW]
+            if not np.isfinite(X).all():
+                continue
 
-    buffer.append(exp)
+            X = normalize(X)
 
-    if len(buffer) > 100000:
-        buffer.pop(0)
+            y = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
+
+            if not np.isfinite(y):
+                continue
+
+            X_all.append(X)
+            y_all.append(y)
+            stock_ids.append(f)
+
+    return np.array(X_all), np.array(y_all), np.array(stock_ids)
 
 
-def sample(batch=64):
+# =========================
+# CROSS-SECTIONAL BACKTEST
+# =========================
+def backtest_cross_section(model, X, y, stock_ids):
+    model.eval()
 
-    idx = np.random.choice(len(buffer),batch)
-
-    return [buffer[i] for i in idx]
-
-
-# ---------------------------------------------------
-# Training
-# ---------------------------------------------------
-
-episodes = 200
-
-epsilon = 1.0
-
-for ep in range(episodes):
-
-    s = env.reset()
-
-    total_reward = 0
-
-    while True:
-
-        if random.random() < epsilon:
-            a = random.randint(0,2)
-        else:
-            with torch.no_grad():
-                q = model(torch.tensor(s))
-                a = torch.argmax(q).item()
-
-        s2,r,done = env.step(a)
-
-        store((s,a,r,s2,done))
-
-        s = s2
-
-        total_reward += r
-
-        if len(buffer) > 1000:
-
-            batch = sample()
-
-            states = torch.tensor([b[0] for b in batch])
-            actions = torch.tensor([b[1] for b in batch])
-            rewards = torch.tensor([b[2] for b in batch])
-            next_states = torch.tensor([b[3] for b in batch])
-            dones = torch.tensor([b[4] for b in batch])
-
-            q = model(states)
-
-            q = q.gather(1,actions.unsqueeze(1)).squeeze()
-
-            with torch.no_grad():
-                q_next = model(next_states).max(1)[0]
-
-            target = rewards + gamma*q_next*(1-dones)
-
-            loss = ((q-target)**2).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        if done:
-            break
-
-    epsilon *= 0.995
-
-    print("Episode",ep,"Reward",total_reward)
-
-# ---------------------------------------------------
-# Test policy
-# ---------------------------------------------------
-
-s = env.reset()
-
-positions = []
-
-while True:
+    X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
 
     with torch.no_grad():
+        preds = model(X).cpu().numpy().flatten()
 
-        a = torch.argmax(model(torch.tensor(s))).item()
+    # build dataframe
+    df = pd.DataFrame({
+        "pred": preds,
+        "ret": y,
+        "stock": stock_ids
+    })
 
-    positions.append(a-1)
+    equity = 1.0
+    curve = []
 
-    s,r,done = env.step(a)
+    # simulate daily cross-section trading
+    for i in range(0, len(df), 1000):
 
-    if done:
-        break
+        batch = df.iloc[i:i+1000]
+        if len(batch) < 50:
+            continue
+
+        # rank stocks
+        batch = batch.sort_values("pred")
+
+        longs = batch.tail(TOP_K)
+        shorts = batch.head(TOP_K)
+
+        long_ret = longs["ret"].mean()
+        short_ret = shorts["ret"].mean()
+
+        pnl = long_ret - short_ret
+
+        # transaction cost
+        pnl -= FEE * 2 * TOP_K
+
+        equity *= (1 + pnl)
+        curve.append(equity)
+
+    return np.array(curve)
 
 
-plt.plot(prices[:len(positions)])
-plt.plot(np.cumsum(positions))
-plt.show()
+# =========================
+# SHARPE RATIO
+# =========================
+def sharpe(curve):
+    rets = np.diff(curve) / curve[:-1]
+    if rets.std() == 0:
+        return 0
+    return np.sqrt(252) * rets.mean() / rets.std()
+
+
+# =========================
+# TRAIN
+# =========================
+def train(model, X, y, epochs=3):
+    opt = optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.MSELoss()
+
+    X = torch.tensor(X, dtype=torch.float32).to(DEVICE)
+    y = torch.tensor(y, dtype=torch.float32).unsqueeze(-1).to(DEVICE)
+
+    for e in range(epochs):
+        model.train()
+        pred = model(X)
+        loss = loss_fn(pred, y)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        print(f"epoch {e} loss {loss.item():.6f}")
+
+
+# =========================
+# MAIN PIPELINE
+# =========================
+def main():
+
+    path = kagglehub.dataset_download(
+        "borismarjanovic/price-volume-data-for-all-us-stocks-etfs"
+    )
+
+    files = glob(os.path.join(path, "Stocks", "*.txt"))
+    files = random.sample(files, SAMPLES)  # controlled research set
+
+    print("stocks:", len(files))
+
+    print("building dataset...")
+    X, y, stock_ids = load_all_data(files)
+
+    print("total samples:", len(X))
+
+    # train/val split (time-aware approximate)
+    split = int(0.8 * len(X))
+    X_train, X_val = X[:split], X[split:]
+    y_train, y_val = y[:split], y[split:]
+    ids_val = stock_ids[split:]
+
+    model = AlphaModel().to(DEVICE)
+
+    print("training...")
+    train(model, X_train, y_train, epochs=EPOCHS)
+
+    print("backtesting...")
+    curve = backtest_cross_section(model, X_val, y_val, ids_val)
+
+    s = sharpe(curve)
+    print("\nFINAL SHARPE:", s)
+
+    # =========================
+    # SAVE MODEL
+    # =========================
+    torch.save(model.state_dict(), "alpha_model.pth")
+    print("Saved model → alpha_model.pth")
+
+
+if __name__ == "__main__":
+    main()
