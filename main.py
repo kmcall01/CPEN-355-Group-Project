@@ -13,9 +13,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WINDOW = 64
 TOP_K = 20
 FEE = 0.0005
-EPOCHS = 100
+EPOCHS = 20
 SAMPLES = 700
-LR = 1e-4
+LR = 5e-4
+
 
 # =========================
 # FEATURES
@@ -41,7 +42,7 @@ def compute_features(df):
 
 
 # =========================
-# BUILD DATASET 
+# DATASET
 # =========================
 def build_dataset(files):
     data_by_date = {}
@@ -56,20 +57,23 @@ def build_dataset(files):
         if len(df) < WINDOW + 10:
             continue
 
-        feats = df[[
-            "ret", "logret", "mom5", "vol",
-            "ma_ratio", "hl_range", "vol_change"
-        ]].values
+        feats = df[
+            ["ret", "logret", "mom5", "vol",
+             "ma_ratio", "hl_range", "vol_change"]
+        ].values
 
         prices = df["Close"].values
         dates = pd.to_datetime(df["Date"]).values
 
         for i in range(len(df) - WINDOW - 5):
-            X = feats[i:i+WINDOW]
-            y = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
+            X = feats[i:i+WINDOW]   # (window, features)
+
+            future_ret = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
+            y = 1.0 if future_ret > 0 else 0.0
+
             date = dates[i+WINDOW]
 
-            if not np.isfinite(X).all() or not np.isfinite(y):
+            if not np.isfinite(X).all():
                 continue
 
             if date not in data_by_date:
@@ -78,7 +82,6 @@ def build_dataset(files):
             data_by_date[date]["X"].append(X)
             data_by_date[date]["y"].append(y)
 
-    
     for date in data_by_date:
         data_by_date[date]["X"] = np.stack(data_by_date[date]["X"])
         data_by_date[date]["y"] = np.array(data_by_date[date]["y"])
@@ -110,38 +113,33 @@ def apply_normalization(data_by_date, mu, std):
 
 
 # =========================
-# MODEL
+# NEURAL NETWORK MODEL (LSTM)
 # =========================
-class AlphaModel(nn.Module):
-    def __init__(self, n_features):
+class LSTMAlpha(nn.Module):
+    def __init__(self, n_features, hidden=64, layers=2):
         super().__init__()
 
-        self.net = nn.Sequential(
-            nn.Linear(WINDOW * n_features, 256),
+        self.lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden,
+            num_layers=layers,
+            batch_first=True,
+            dropout=0.2 if layers > 1 else 0.0
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 32),
             nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Dropout(0.2),
+            nn.Linear(32, 1)
         )
 
     def forward(self, x):
-        x = x.reshape(x.shape[0], -1)
-        return self.net(x).squeeze(-1)
+        # x: (batch, window, features)
+        out, _ = self.lstm(x)
 
-
-# =========================
-# RANKING LOSS
-# =========================
-def ranking_loss(pred, target):
-    pred = pred - pred.mean()
-    target = target - target.mean()
-
-    cov = (pred * target).mean()
-    pred_std = pred.std() + 1e-6
-    target_std = target.std() + 1e-6
-
-    corr = cov / (pred_std * target_std)
-    return -corr
+        last = out[:, -1, :]  # last timestep
+        return self.head(last).squeeze(-1)
 
 
 # =========================
@@ -149,6 +147,7 @@ def ranking_loss(pred, target):
 # =========================
 def train(model, train_dates, data_by_date):
     opt = optim.Adam(model.parameters(), lr=LR)
+    loss_fn = nn.BCEWithLogitsLoss()
 
     for epoch in range(EPOCHS):
         model.train()
@@ -165,8 +164,8 @@ def train(model, train_dates, data_by_date):
             X = torch.from_numpy(batch["X"]).float().to(DEVICE)
             y = torch.from_numpy(batch["y"]).float().to(DEVICE)
 
-            pred = model(X)
-            loss = ranking_loss(pred, y)
+            logits = model(X)
+            loss = loss_fn(logits, y)
 
             opt.zero_grad()
             loss.backward()
@@ -196,10 +195,10 @@ def backtest(model, val_dates, data_by_date):
             X = torch.from_numpy(batch["X"]).float().to(DEVICE)
             y = batch["y"]
 
-            pred = model(X).cpu().numpy()
+            probs = torch.sigmoid(model(X)).cpu().numpy()
 
             df = pd.DataFrame({
-                "pred": pred,
+                "pred": probs,
                 "ret": y
             })
 
@@ -209,8 +208,7 @@ def backtest(model, val_dates, data_by_date):
             shorts = df.head(TOP_K)
 
             pnl = longs["ret"].mean() - shorts["ret"].mean()
-
-            pnl -= FEE  # realistic cost
+            pnl -= FEE
 
             equity *= (1 + pnl)
             curve.append(equity)
@@ -259,7 +257,7 @@ def main():
 
     n_features = data_by_date[dates[0]]["X"].shape[2]
 
-    model = AlphaModel(n_features).to(DEVICE)
+    model = LSTMAlpha(n_features).to(DEVICE)
 
     print("training...")
     train(model, train_dates, data_by_date)
@@ -270,8 +268,8 @@ def main():
     s = sharpe(curve)
     print("\nFINAL SHARPE:", s)
 
-    torch.save(model.state_dict(), "alpha_model.pth")
-    print("Saved -> alpha_model.pth")
+    torch.save(model.state_dict(), "lstm_alpha.pth")
+    print("Saved -> lstm_alpha.pth")
 
 
 if __name__ == "__main__":
