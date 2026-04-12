@@ -13,9 +13,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WINDOW = 64
 TOP_K = 20
 FEE = 0.0005
-EPOCHS = 50
-SAMPLES = 500
-LR = 1e-3
+EPOCHS = 100
+SAMPLES = 700
+LR = 1e-4
 
 # =========================
 # FEATURES
@@ -78,7 +78,7 @@ def build_dataset(files):
             data_by_date[date]["X"].append(X)
             data_by_date[date]["y"].append(y)
 
-    # 🔥 convert lists → numpy ONCE (big speedup)
+    
     for date in data_by_date:
         data_by_date[date]["X"] = np.stack(data_by_date[date]["X"])
         data_by_date[date]["y"] = np.array(data_by_date[date]["y"])
@@ -271,7 +271,7 @@ def main():
     print("\nFINAL SHARPE:", s)
 
     torch.save(model.state_dict(), "alpha_model.pth")
-    print("Saved → alpha_model.pth")
+    print("Saved -> alpha_model.pth")
 
 
 if __name__ == "__main__":
