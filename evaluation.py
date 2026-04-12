@@ -15,11 +15,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 WINDOW = 64
 HORIZON = 5
-NUM_STOCKS = 5
-STEP = 5
+NUM_STOCKS = 10  
+
+SAVE_DIR = "plots"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 # =========================
-# FEATURES (MUST MATCH TRAINING)
+# FEATURES
 # =========================
 def compute_features(df):
     df = df.copy()
@@ -52,26 +54,33 @@ def normalize(X):
 # =========================
 # MODELS
 # =========================
-class AlphaModel(nn.Module):
-    def __init__(self, n_features=7):
+class LSTMAlpha(nn.Module):
+    def __init__(self, n_features, hidden=64, layers=2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(WINDOW * n_features, 256),
+
+        self.lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=hidden,
+            num_layers=layers,
+            batch_first=True,
+            dropout=0.2 if layers > 1 else 0.0
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden, 32),
             nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Dropout(0.2),   
+            nn.Linear(32, 1)
         )
 
     def forward(self, x):
-        x = x.reshape(x.shape[0], -1)
-        return self.net(x).squeeze(-1)
-
+        out, _ = self.lstm(x)
+        return self.head(out[:, -1, :]).squeeze(-1)
 
 class LogisticAlpha(nn.Module):
-    def __init__(self, n_features=7):
+    def __init__(self, n_features):
         super().__init__()
-        self.linear = nn.Linear(WINDOW * n_features, 1)
+        self.linear = nn.Linear(n_features * WINDOW, 1)
 
     def forward(self, x):
         x = x.reshape(x.shape[0], -1)
@@ -79,16 +88,16 @@ class LogisticAlpha(nn.Module):
 
 
 # =========================
-# MODEL LOADER
+# LOAD MODEL
 # =========================
 def load_model(path, n_features):
     state = torch.load(path, map_location=DEVICE)
 
-    if "net.0.weight" in state:
-        print("Loading Neural Network model")
-        model = AlphaModel(n_features)
+    if "lstm.weight_ih_l0" in state:
+        print("Loading LSTM model")
+        model = LSTMAlpha(n_features)
     else:
-        print("Loading Logistic Regression model")
+        print("Loading Logistic model")
         model = LogisticAlpha(n_features)
 
     model.load_state_dict(state)
@@ -98,26 +107,20 @@ def load_model(path, n_features):
 
 
 # =========================
-# RUN PREDICTIONS (FIXED)
+# PREDICTIONS
 # =========================
-def run_predictions(df, model, use_logistic=False):
+def run_predictions(df, model, is_logistic=False):
 
-   
     feats = df[[
-        "ret",
-        "logret",
-        "mom5",
-        "vol",
-        "ma_ratio",
-        "hl_range",
-        "vol_change"
+        "ret", "logret", "mom5", "vol",
+        "ma_ratio", "hl_range", "vol_change"
     ]].values
 
     prices = df["Close"].values
 
     preds, actuals, times = [], [], []
 
-    for i in range(0, len(df) - WINDOW - HORIZON, STEP):
+    for i in range(len(df) - WINDOW - HORIZON):
 
         X = feats[i:i+WINDOW]
 
@@ -130,9 +133,9 @@ def run_predictions(df, model, use_logistic=False):
         with torch.no_grad():
             out = model(X_t).cpu().item()
 
-        # logistic model probability
-        if use_logistic:
+        if is_logistic:
             pred = 1 / (1 + np.exp(-out))
+            pred = pred - 0.5   # center it
         else:
             pred = out
 
@@ -149,30 +152,40 @@ def run_predictions(df, model, use_logistic=False):
 
 
 # =========================
-# PLOT
+# PLOT + SAVE
 # =========================
-def plot_stock(df, preds, actuals, times, title):
+def plot_and_save(df, preds, actuals, times, title, filename):
+
     close = df["Close"].values
 
     plt.figure(figsize=(14, 5))
     plt.plot(close, linewidth=1)
 
+    correct_count = 0
+
     for p, a, t in zip(preds, actuals, times):
+
         if t >= len(close):
             continue
 
-        correct = np.sign(p - 0.5 if p <= 1 else p) == np.sign(a)
+        correct = np.sign(p) == np.sign(a)
+        if correct:
+            correct_count += 1
 
         color = "green" if correct else "red"
         marker = "o" if correct else "x"
 
-        plt.scatter(t, close[t], color=color, s=25, marker=marker)
+        plt.scatter(t, close[t], color=color, s=20, marker=marker)
 
-    plt.title(title)
+    acc = correct_count / len(preds) if len(preds) > 0 else 0
+
+    plt.title(f"{title} | Accuracy: {acc:.2%}")
     plt.xlabel("Time")
     plt.ylabel("Price")
+
     plt.tight_layout()
-    plt.show()
+    plt.savefig(os.path.join(SAVE_DIR, filename))
+    plt.close()
 
 
 # =========================
@@ -183,7 +196,7 @@ def main():
     print("Loading dataset...")
 
     path = kagglehub.dataset_download(
-        "borismarjanovic/price-volume-data-for-all-stocks-etfs"
+        "borismarjanovic/price-volume-data-for-all-us-stocks-etfs"
     )
 
     files = glob(os.path.join(path, "Stocks", "*.txt"))
@@ -191,12 +204,14 @@ def main():
 
     print("Loading models...")
 
-    nn_model = load_model("alpha_model.pth", n_features=7)
-    log_model = load_model("logistic_alpha.pth", n_features=7)
+    lstm_model = load_model("lstm_alpha.pth", 7)
+    log_model = load_model("logistic_alpha.pth", 7)
 
-    print("\nEvaluating models...\n")
+    print("\nEvaluating...\n")
 
     for f in files:
+
+        name = os.path.basename(f)
 
         try:
             df = pd.read_csv(f)
@@ -204,28 +219,32 @@ def main():
         except:
             continue
 
-        if len(df) < WINDOW + 100:
+        if len(df) < WINDOW + 50:
             continue
 
         # =====================
-        # NN evaluation
+        # LSTM
         # =====================
-        preds, actuals, times = run_predictions(df, nn_model, use_logistic=False)
+        preds, actuals, times = run_predictions(df, lstm_model, False)
 
         if len(preds) > 0:
-            acc = (np.sign(preds) == np.sign(actuals)).mean()
-            print(f"[NN] {os.path.basename(f)} | directional accuracy: {acc:.2%}")
-            plot_stock(df, preds, actuals, times, f"NN - {os.path.basename(f)}")
+            plot_and_save(
+                df, preds, actuals, times,
+                f"LSTM - {name}",
+                f"LSTM_{name}.png"
+            )
 
         # =====================
-        # Logistic evaluation
+        # LOGISTIC
         # =====================
-        preds, actuals, times = run_predictions(df, log_model, use_logistic=True)
+        preds, actuals, times = run_predictions(df, log_model, True)
 
         if len(preds) > 0:
-            acc = (np.sign(preds - 0.5) == np.sign(actuals)).mean()
-            print(f"[LOG] {os.path.basename(f)} | directional accuracy: {acc:.2%}")
-            plot_stock(df, preds, actuals, times, f"LOG - {os.path.basename(f)}")
+            plot_and_save(
+                df, preds, actuals, times,
+                f"LOG - {name}",
+                f"LOG_{name}.png"
+            )
 
 
 if __name__ == "__main__":
