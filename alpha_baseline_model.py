@@ -68,7 +68,7 @@ def build_dataset(files):
         for i in range(len(df) - WINDOW - 5):
             X = feats[i:i+WINDOW]
             future_ret = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
-            y = 1.0 if future_ret > 0 else 0.0   # ✅ classification target
+            y = 1.0 if future_ret > 0 else 0.0   
 
             date = dates[i+WINDOW]
 
