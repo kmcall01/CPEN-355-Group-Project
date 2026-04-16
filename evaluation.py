@@ -15,7 +15,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 WINDOW = 64
 HORIZON = 5
-NUM_STOCKS = 10  
+NUM_STOCKS = 10
 
 SAVE_DIR = "plots"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -69,7 +69,7 @@ class LSTMAlpha(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden, 32),
             nn.ReLU(),
-            nn.Dropout(0.2),   
+            nn.Dropout(0.2),
             nn.Linear(32, 1)
         )
 
@@ -216,15 +216,12 @@ def main():
         try:
             df = pd.read_csv(f)
             df = compute_features(df)
-        except:
+        except Exception:
             continue
 
         if len(df) < WINDOW + 50:
             continue
 
-        # =====================
-        # LSTM
-        # =====================
         preds, actuals, times = run_predictions(df, lstm_model, False)
 
         if len(preds) > 0:
@@ -234,9 +231,6 @@ def main():
                 f"LSTM_{name}.png"
             )
 
-        # =====================
-        # LOGISTIC
-        # =====================
         preds, actuals, times = run_predictions(df, log_model, True)
 
         if len(preds) > 0:

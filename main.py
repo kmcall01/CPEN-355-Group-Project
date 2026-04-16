@@ -11,6 +11,7 @@ import random
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 WINDOW = 64
+HORIZON = 5
 TOP_K = 20
 FEE = 0.0005
 EPOCHS = 20
@@ -51,7 +52,7 @@ def build_dataset(files):
         try:
             df = pd.read_csv(f)
             df = compute_features(df)
-        except:
+        except Exception:
             continue
 
         if len(df) < WINDOW + 10:
@@ -65,10 +66,13 @@ def build_dataset(files):
         prices = df["Close"].values
         dates = pd.to_datetime(df["Date"]).values
 
-        for i in range(len(df) - WINDOW - 5):
-            X = feats[i:i+WINDOW]   # (window, features)
+        for i in range(len(df) - WINDOW - HORIZON):
+            X = feats[i:i+WINDOW]
 
-            future_ret = (prices[i+WINDOW+5] - prices[i+WINDOW]) / prices[i+WINDOW]
+            future_ret = (
+                (prices[i + WINDOW + HORIZON] - prices[i + WINDOW])
+                / prices[i + WINDOW]
+            )
             y = 1.0 if future_ret > 0 else 0.0
 
             date = dates[i+WINDOW]
@@ -135,10 +139,8 @@ class LSTMAlpha(nn.Module):
         )
 
     def forward(self, x):
-        # x: (batch, window, features)
         out, _ = self.lstm(x)
-
-        last = out[:, -1, :]  # last timestep
+        last = out[:, -1, :]
         return self.head(last).squeeze(-1)
 
 
@@ -173,7 +175,8 @@ def train(model, train_dates, data_by_date):
 
             losses.append(loss.item())
 
-        print(f"epoch {epoch} loss {np.mean(losses):.6f}")
+        if losses:
+            print(f"epoch {epoch} loss {np.mean(losses):.6f}")
 
 
 # =========================
